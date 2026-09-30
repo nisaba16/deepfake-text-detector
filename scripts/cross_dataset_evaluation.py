@@ -20,8 +20,10 @@ from load_and_evaluate import (
     load_saved_detector, 
     evaluate_detector_on_dataset, 
     print_evaluation_results,
-    load_dataset
+    select_eval_part,
+    warn_if_training_dataset,
 )
+from textdet.data import resolve
 
 
 def run_cross_dataset_evaluation(args):
@@ -50,14 +52,18 @@ def run_cross_dataset_evaluation(args):
     results = {}
     
     for dataset_config in args.datasets:
-        dataset_name, data_path = dataset_config.split(':')
-        
+        # name:path (historical form), or a catalog name alone (mage_ood_gpt4, raid_sample, ...)
+        ts = resolve(dataset_config)
+        dataset_name = ts.name or dataset_config
+
         print(f"\n{'='*50}")
         print(f"Evaluating on {dataset_name}")
         print(f"{'='*50}")
-        
+
         # Load evaluation dataset
-        texts, labels = load_dataset(dataset_name, data_path)
+        texts, labels = ts.texts, ts.labels
+        texts, labels = select_eval_part(texts, labels, args.eval_part, args.eval_test_frac)
+        warn_if_training_dataset(metadata, dataset_name)
         print(f"Loaded {len(texts)} samples")
         print(f"Label distribution: {np.bincount(labels)} (0=real, 1=fake)")
         
@@ -76,7 +82,7 @@ def run_cross_dataset_evaluation(args):
         model_name = Path(args.model_path).stem
         print_evaluation_results(eval_results, model_name, dataset_name)
         
-        results[dataset_name] = eval_results['metrics']
+        results[dataset_name] = {**eval_results['metrics'], 'eval_part': args.eval_part}
     
     # Print summary comparison
     print(f"\n{'='*80}")
@@ -113,7 +119,8 @@ def main():
     
     # Datasets to evaluate on
     parser.add_argument("--datasets", nargs='+', required=True,
-                       help="List of dataset_name:path pairs (e.g., mercor_ai:data/mercor-ai/train.csv)")
+                       help="Dataset specs: name:path pairs (e.g., mercor_ai:data/mercor-ai/train.csv) or "
+                            "catalog names (mage_ood_gpt4, raid_sample, ...; see textdet/data/catalog.py)")
     
     # Inference parameters
     parser.add_argument("--device", type=str, default="cuda:0",
@@ -126,12 +133,17 @@ def main():
     # Thresholding / optimization pass-through to load_and_evaluate
     parser.add_argument("--threshold", type=float, default=None,
                        help="Override decision threshold on P(fake); predictions = (P(fake) >= threshold)")
-    parser.add_argument("--optimize_threshold", type=str, default=None, choices=["f1"],
+    parser.add_argument("--optimize_threshold", type=str, default=None, choices=["f1", "fpr0.01", "fpr0.05"],
                        help="Optimize a threshold on a validation split using the given metric (e.g., 'f1')")
     parser.add_argument("--optimize_split", type=float, default=0.2,
                        help="Validation split fraction when optimizing threshold")
     parser.add_argument("--random_state", type=int, default=42,
                        help="Random seed for threshold optimization split")
+    parser.add_argument("--eval_part", type=str, default="all", choices=["all", "select", "test"],
+                       help="Score the whole set, or a fixed stratified part of it: 'select' to choose "
+                            "configs (sweeps), 'test' only for the final number (use another --output_dir)")
+    parser.add_argument("--eval_test_frac", type=float, default=0.5,
+                       help="Fraction of each evaluation set in the 'test' part")
     
     # Output
     parser.add_argument("--save_summary", action="store_true",

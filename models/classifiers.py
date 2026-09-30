@@ -8,7 +8,7 @@ from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.covariance import EllipticEnvelope
 from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
 from sklearn.preprocessing import StandardScaler, MaxAbsScaler
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.svm import SVC
@@ -94,38 +94,27 @@ class DeepBinaryDetector:
         If external validation tensors X_val/y_val are provided they are used; otherwise
         a split is created when validation_split>0.
         """
-        # Scale features
-        embeddings = self.scaler.fit_transform(embeddings)
         if isinstance(labels, torch.Tensor):
             labels = labels.cpu().numpy()
-
-        X = torch.FloatTensor(embeddings)
-        y = torch.FloatTensor(labels)
+        embeddings, labels = np.asarray(embeddings), np.asarray(labels)
 
         # Perform internal split only if external not provided
         if X_val is None and validation_split > 0:
-            X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(
-                X.cpu().numpy(), y.cpu().numpy(),
+            embeddings, X_val, labels, y_val = train_test_split(
+                embeddings, labels,
                 test_size=validation_split,
-                stratify=y.cpu().numpy()
+                stratify=labels
             )
-            X_train = torch.FloatTensor(X_train_np).to(self.device)
-            X_val = torch.FloatTensor(X_val_np).to(self.device)
-            y_train = torch.FloatTensor(y_train_np).to(self.device)
-            y_val = torch.FloatTensor(y_val_np).to(self.device)
-        else:
-            # Use provided validation or none
-            X_train = X.to(self.device)
-            y_train = y.to(self.device)
-            if X_val is not None and isinstance(X_val, np.ndarray):
-                X_val = torch.FloatTensor(X_val).to(self.device)
-            if y_val is not None and isinstance(y_val, np.ndarray):
-                y_val = torch.FloatTensor(y_val).to(self.device)
-            if X_val is not None and isinstance(X_val, torch.Tensor):
-                # Ensure correct device
-                X_val = X_val.to(self.device)
-            if y_val is not None and isinstance(y_val, torch.Tensor):
-                y_val = y_val.to(self.device)
+
+        # Fit the scaler on the training rows only; validation rows (internal or external) are only
+        # transformed, otherwise validation loss and best-epoch selection run on differently scaled inputs
+        X_train = torch.FloatTensor(self.scaler.fit_transform(embeddings)).to(self.device)
+        y_train = torch.FloatTensor(labels).to(self.device)
+        if X_val is not None:
+            X_val = X_val.cpu().numpy() if isinstance(X_val, torch.Tensor) else np.asarray(X_val)
+            X_val = torch.FloatTensor(self.scaler.transform(X_val)).to(self.device)
+            y_val = y_val.cpu().numpy() if isinstance(y_val, torch.Tensor) else np.asarray(y_val)
+            y_val = torch.FloatTensor(y_val).to(self.device)
 
         # DataLoaders
         train_dataset = TensorDataset(X_train, y_train.view(-1, 1))
@@ -197,7 +186,7 @@ class DeepBinaryDetector:
         self.model.eval()
         with torch.no_grad():
             outputs = self.model(X)
-            probs = outputs.cpu().numpy().squeeze()
+            probs = outputs.cpu().numpy().reshape(-1)  # 1-D even for a single text
             preds = (probs > 0.5).astype(int)
         
         # Return predictions and optionally probabilities 
@@ -230,8 +219,11 @@ class BinaryDetector:
         self._is_fitted = False
         self._centroid_space = "preprocessed"  # informational
     
-    def _init_classifier(self, classifier_type="svm", sparse_input: bool = False):
-        """Initialize classifier (SVM or logistic regression)"""
+    def _init_classifier(self, classifier_type="svm", sparse_input: bool = False, n_features: int = None):
+        """Initialize classifier (SVM or logistic regression)
+
+        n_features: dimension of the preprocessed features (after PCA/SVD), used to size the neural net
+        """
         if classifier_type == "svm":
             # RBF SVM doesn't support sparse matrices. If features are sparse, prefer LR with saga.
             if sparse_input:
@@ -266,8 +258,14 @@ class BinaryDetector:
                 random_state=self.random_state
             )
         elif classifier_type == "neural":
-            # Use PCA-reduced dim if PCA is fitted, else raw input dim
-            dim = self.pca.n_components_ if self.pca is not None else self.input_dim
+            if sparse_input:
+                raise ValueError("The neural classifier needs dense features: with TF-IDF pass --svd_components "
+                                 "or --tfidf_dense")
+            # Size the network on the preprocessed features: PCA or SVD output, else the raw input
+            if n_features is not None:
+                dim = n_features
+            else:
+                dim = self.pca.n_components_ if self.pca is not None else self.input_dim
             return DeepBinaryDetector(
                 input_dim=dim,
                 device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -371,7 +369,8 @@ class BinaryDetector:
         # Train classifier
         print(f"Fitting {classifier_type.upper()} classifier...")
         sparse_input = issparse(features)
-        self.classifier = self._init_classifier(classifier_type, sparse_input=sparse_input)
+        self.classifier = self._init_classifier(classifier_type, sparse_input=sparse_input,
+                                                n_features=features.shape[1])
         
         # Handle neural network training separately
         if classifier_type == "neural":
@@ -552,6 +551,9 @@ class OutlierDetections:
         self.contamination = contamination
         self.random_state = random_state
 
+        if use_trajectory:
+            # The trajectory detector used to be fit on broken features and was never read by predict_*
+            raise NotImplementedError("use_trajectory is not supported: trajectory scores are not used in predictions")
         self.use_trajectory = use_trajectory
         self.traj_detector = None  
 
@@ -623,9 +625,15 @@ class OutlierDetections:
             X_train, y_train = embeddings, labels
             X_val, y_val = None, None
 
-        # Fit scaler/PCA on training only
-        self.real_embeddings = X_train
-        self.real_embeddings_scaled = self.scaler.fit_transform(X_train)
+        # One-class: learn the human (label 0) distribution only; AI rows are only used for evaluation.
+        X_real = X_train if y_train is None else X_train[np.asarray(y_train) == 0]
+        if X_real.shape[0] == 0:
+            raise ValueError("No human (label 0) rows in the training split to fit the one-class detector on")
+        print(f"Fitting on {X_real.shape[0]} human texts (AI texts are only used for evaluation)")
+
+        # Fit scaler/PCA on the human training rows only
+        self.real_embeddings = X_real
+        self.real_embeddings_scaled = self.scaler.fit_transform(X_real)
         self.real_embeddings_pca = self.pca.fit_transform(self.real_embeddings_scaled)
 
         print(f"PCA reduced shape: {self.real_embeddings_pca.shape}")
@@ -642,8 +650,9 @@ class OutlierDetections:
         self.outlier_detector = self._init_detector()
         self.outlier_detector.fit(self.real_embeddings_pca)
 
-        # Train predictions/accuracy
-        train_raw_preds = self.outlier_detector.predict(self.real_embeddings_pca)
+        # Train predictions/accuracy on every training row (human and AI)
+        X_train_pca = self.pca.transform(self.scaler.transform(X_train))
+        train_raw_preds = self.outlier_detector.predict(X_train_pca)
         train_predictions = np.array([0 if pred == 1 else 1 for pred in train_raw_preds])
         train_acc = accuracy_score(y_train, train_predictions) if y_train is not None else None
 
@@ -662,6 +671,10 @@ class OutlierDetections:
             val_predictions = np.array([0 if pred == 1 else 1 for pred in val_raw_preds])
             val_acc = accuracy_score(y_val, val_predictions)
             results['val_accuracy'] = val_acc
+            # Accuracy is misleading when classes are imbalanced; AUROC of the anomaly score is not.
+            if len(np.unique(y_val)) > 1:
+                results['val_auroc'] = roc_auc_score(y_val, -self.outlier_detector.decision_function(X_val_pca))
+                print(f"Validation AUROC: {results['val_auroc']:.3f}")
             train_acc_str = f"{train_acc:.3f}" if isinstance(train_acc, (int, float, np.floating)) else "N/A"
             val_acc_str = f"{val_acc:.3f}" if isinstance(val_acc, (int, float, np.floating)) else "N/A"
             print(f"Training accuracy: {train_acc_str} | Validation accuracy: {val_acc_str}")
@@ -762,28 +775,27 @@ class OutlierDetections:
         
         return pair_predictions, details
 
-    def learn_real_manifold(self, real_texts, extractor_model, target_layer=-2, pooling="mean", batch_size=32):
+    def learn_real_manifold(self, real_texts, extractor_model, target_layer=-2, pooling="mean", batch_size=32,
+                            max_length=512):
         """
         Train outlier detector on real texts only - texts that deviate from this manifold are considered fake.
         
         Args:
             real_texts: list of real text strings to learn the manifold from
-            extractor_model: embedding extractor model
-            target_layer: which transformer layer to use for embeddings
-            pooling: pooling method ('mean', 'cls', 'last_token', 'all')
+            extractor_model: EmbeddingExtractor
+            target_layer: which hidden state to use (negative counts from the last)
+            pooling: pooling method of EmbeddingExtractor.get_pooled_layer_embeddings ('mean', 'max', 'last', ...)
             batch_size: batch size for processing
+            max_length: maximum tokens per text
         """
         
         print(f"Learning real text manifold from {len(real_texts)} samples...")
         print(f"Using layer {target_layer} with {self.detector_type} detector")
 
-        # Extract embeddings in one go (batched)
-        if pooling == 'all':
-            all_embeds = extractor_model._get_all_token_embeddings(real_texts, batch_size=batch_size)
-        else:
-            all_embeds = extractor_model.get_all_layer_embeddings(real_texts, pooling=pooling, batch_size=batch_size)
-        
-        self.real_embeddings = all_embeds[target_layer]  # shape: (num_texts, hidden_dim)
+        # One pooled vector per text from the target layer
+        self.real_embeddings = extractor_model.get_pooled_layer_embeddings(
+            real_texts, layer_idx=target_layer, pooling=pooling, batch_size=batch_size, max_length=max_length
+        )  # shape: (num_texts, hidden_dim)
 
         # Check for NaN/Inf values
         n_nan = np.isnan(self.real_embeddings).sum()
@@ -813,53 +825,20 @@ class OutlierDetections:
 
         print(f"✓ {self.detector_type.upper()} outlier detector trained on real text manifold!")
         
-        # Optional trajectory-based features
-        if self.use_trajectory:
-            print("Extracting trajectory features from real texts...")
-            traj_features = []
-            for text in real_texts:
-                try:
-                    if pooling == 'all':
-                        token_embeds = extractor_model._get_all_token_embeddings([text], batch_size=1)[target_layer]
-                    else:
-                        # Get token-level embeddings for trajectory
-                        token_embeds = extractor_model.get_all_layer_embeddings(text, pooling="all", batch_size=1)[target_layer]
                     
-                    traj_metrics = self.trajectory_metrics(token_embeds)
-                    traj_vector = [
-                        traj_metrics['mean_angle'],
-                        traj_metrics['std_angle'], 
-                        traj_metrics['angle_entropy'],
-                        traj_metrics['trajectory_smoothness'],
-                        traj_metrics['max_curvature']
-                    ]
-                    traj_features.append(traj_vector)
-                except Exception as e:
-                    print(f"Warning: Failed to extract trajectory for one text: {e}")
-                    traj_features.append([0.0, 0.0, 0.0, 0.0, 0.0])
-            
-            if traj_features:
-                traj_features = np.array(traj_features)
-                # Simple EllipticEnvelope as trajectory detector
-                self.traj_detector = EllipticEnvelope(
-                    contamination=self.contamination,
-                    random_state=self.random_state
-                )
-                self.traj_detector.fit(traj_features)
-                print("✓ Trajectory detector trained!")
-
-
-    def predict_texts_batch(self, texts, extractor_model, target_layer=-2, pooling="mean", batch_size=32, return_probabilities=True):
+    def predict_texts_batch(self, texts, extractor_model, target_layer=-2, pooling="mean", batch_size=32,
+                            return_probabilities=True, max_length=512):
         """
         Predict multiple texts in batch using trained outlier detector.
 
         Args:
             texts: list of text strings to predict
-            extractor_model: embedding extractor
-            target_layer: which transformer layer to use
-            pooling: pooling method
+            extractor_model: EmbeddingExtractor
+            target_layer: which hidden state to use (same as in learn_real_manifold)
+            pooling: pooling method (same as in learn_real_manifold)
             batch_size: batch size for processing
             return_probabilities: whether to return probability estimates
+            max_length: maximum tokens per text
             
         Returns:
             predictions: list[int] (0=real/inlier, 1=fake/outlier)
@@ -870,14 +849,9 @@ class OutlierDetections:
         if self.outlier_detector is None:
             raise ValueError("Detector not trained! Call learn_real_manifold() first.")
             
-        # Extract embeddings
-        if pooling == 'all':
-            all_layer_embeds = extractor_model._get_all_token_embeddings(texts, batch_size=batch_size)
-        else:
-            all_layer_embeds = extractor_model.get_all_layer_embeddings(
-                texts, pooling=pooling, batch_size=batch_size
-            )
-        embeddings = all_layer_embeds[target_layer]  # shape: (num_texts, hidden_dim)
+        embeddings = extractor_model.get_pooled_layer_embeddings(
+            texts, layer_idx=target_layer, pooling=pooling, batch_size=batch_size, max_length=max_length
+        )  # shape: (num_texts, hidden_dim)
 
         # Transform embeddings
         embeddings_scaled = self.scaler.transform(embeddings)
@@ -1023,15 +997,16 @@ class TrajectoryClassifier:
         else:
             raise ValueError(f"Unknown classifier_type: {self.classifier_type}")
     
-    def extract_trajectory_features(self, texts, extractor_model, target_layer=-2, batch_size=32):
+    def extract_trajectory_features(self, texts, extractor_model, target_layer=-2, batch_size=32, max_length=512):
         """
         Extract trajectory features from a list of texts
         
         Args:
             texts: list of text strings
-            extractor_model: embedding extractor
-            target_layer: which transformer layer to use
+            extractor_model: EmbeddingExtractor
+            target_layer: which hidden state to use (negative counts from the last)
             batch_size: batch size for processing
+            max_length: maximum tokens per text
             
         Returns:
             features: np.array of shape (n_texts, n_features)
@@ -1041,42 +1016,24 @@ class TrajectoryClassifier:
         features = []
         for i in tqdm(range(0, len(texts), batch_size)):
             batch_texts = texts[i:i + batch_size]
+            # Token-level embeddings of every layer, one dict per text: {layer_idx: (seq, hidden)}
+            batch_embeds = extractor_model.get_all_layer_embeddings(
+                batch_texts, batch_size=batch_size, max_length=max_length, show_progress=False
+            )
+            for layer_embeds in batch_embeds:
+                token_embeds = layer_embeds[sorted(layer_embeds)[target_layer]].astype(np.float32)
             
-            for text in batch_texts:
-                try:
-                    # Get token-level embeddings - use mean pooling as fallback if 'all' fails
-                    try:
-                        layer_embeds = extractor_model.get_all_layer_embeddings(
-                            text, pooling="all", batch_size=1
-                        )
-                        token_embeds = layer_embeds[target_layer]
-                    except Exception as e:
-                        # Fallback: use mean pooling and create pseudo-trajectory
-                        print(f"Warning: Failed to get token embeddings, using mean pooling fallback: {e}")
-                        layer_embeds = extractor_model.get_all_layer_embeddings(
-                            text, pooling="mean", batch_size=1
-                        )
-                        # Create a pseudo-trajectory by replicating the mean embedding
-                        mean_embed = layer_embeds[target_layer]
-                        token_embeds = np.tile(mean_embed, (3, 1))  # Minimum 3 embeddings for trajectory
+                # Compute trajectory metrics (texts under 3 tokens get zeros)
+                traj_metrics = self.trajectory_metrics(token_embeds)
                     
-                    # Compute trajectory metrics
-                    traj_metrics = self.trajectory_metrics(token_embeds)
-                    
-                    # Convert to feature vector
-                    feature_vector = [
-                        traj_metrics['mean_angle'],
-                        traj_metrics['std_angle'],
-                        traj_metrics['angle_entropy'],
-                        traj_metrics['trajectory_smoothness'],
-                        traj_metrics['max_curvature']
-                    ]
-                    features.append(feature_vector)
-                    
-                except Exception as e:
-                    print(f"Error processing text: {e}")
-                    # Add zero features for failed texts
-                    features.append([0.0, 0.0, 0.0, 0.0, 0.0])
+                # Convert to feature vector
+                features.append([
+                    traj_metrics['mean_angle'],
+                    traj_metrics['std_angle'],
+                    traj_metrics['angle_entropy'],
+                    traj_metrics['trajectory_smoothness'],
+                    traj_metrics['max_curvature']
+                ])
         
         return np.array(features)
     

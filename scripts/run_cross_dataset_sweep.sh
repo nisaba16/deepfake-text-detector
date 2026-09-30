@@ -155,12 +155,14 @@ for model in "${MODELS[@]}"; do
         fi
         echo "Using model: $MODEL_PATH"
 
-        # Evaluate on Mercor AI training set (will write summary to $SUMMARY_PATH)
+        # Evaluate on the 'select' half of Mercor AI train (will write summary to $SUMMARY_PATH);
+        # the 'test' half stays untouched for the final score of the chosen config.
         # Use threshold optimization to fix domain shift issues with SVM
         "${ENV_PREFIX[@]}" "$PYTHON_BIN" scripts/cross_dataset_evaluation.py \
           --model_path "$MODEL_PATH" \
           --datasets mercor_ai:"$MERCOR_CSV" \
           --device "$DEVICE" \
+          --eval_part select \
           --optimize_threshold f1 \
           --optimize_split 0.2 \
           --save_summary \

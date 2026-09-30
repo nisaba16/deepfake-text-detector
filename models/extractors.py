@@ -250,7 +250,8 @@ class EmbeddingExtractor(torch.nn.Module):
             max_length: maximum tokens per text
             show_progress: show tqdm progress bar
             return_attention: when pooling='attn', also return the per-text attention weights vector used for pooling
-            normalize: if True, L2-normalize each pooled embedding to unit norm (default: False)
+            normalize: if True, L2-normalize each token embedding before pooling (default: False), the same
+                features as l2_normalize_tokens + pool_embeds_from_layer
         Returns:
             If return_attention is False: np.ndarray shape (num_texts, hidden_size)
             If return_attention is True and pooling='attn': (embeds: np.ndarray (N, H), weights: List[np.ndarray])
@@ -305,6 +306,9 @@ class EmbeddingExtractor(torch.nn.Module):
             for b in range(chosen.size(0)):
                 valid = attention_mask[b].bool()
                 token_reps = chosen[b][valid]  # (valid_seq, hidden)
+                if normalize:
+                    # Per token, before pooling, in fp32 (fp16 norms overflow)
+                    token_reps = F.normalize(token_reps.float(), p=2, dim=-1)
                 if token_reps.shape[0] == 0:
                     vec = torch.zeros(chosen.size(-1), device=chosen.device)
                     w_vec = None
@@ -393,13 +397,6 @@ class EmbeddingExtractor(torch.nn.Module):
 
         embeds = np.vstack(pooled_vectors).astype(np.float32)
         
-        # Optional L2 normalization
-        if normalize:
-            norms = np.linalg.norm(embeds, axis=1, keepdims=True)
-            # Avoid division by zero
-            norms = np.where(norms == 0, 1.0, norms)
-            embeds = embeds / norms
-        
         if return_attention and pooling.lower() in {"attn", "attention", "attn_mean", "attn_weighted"}:
             return embeds, attn_weights_list
         return embeds
@@ -429,6 +426,15 @@ def extract_embed_at_layer(list_embeds, layer_idx):
     selected_embeds_at_choosen_layer = [list_embeds_per_text[layer_idx] for list_embeds_per_text in list_embeds]
 
     return selected_embeds_at_choosen_layer
+
+def l2_normalize_tokens(selected_embeds_at_choosen_layer):
+    """L2-normalize every token vector of every text, in fp32 (fp16 norms overflow).
+
+    The normalization of get_pooled_layer_embeddings(normalize=True), for the pool_embeds_from_layer
+    path, so the memory-efficient and full extraction paths produce the same features.
+    """
+    return [F.normalize(torch.from_numpy(emb).float(), p=2, dim=-1).numpy()
+            for emb in selected_embeds_at_choosen_layer]
 
 def pool_embeds_from_layer(selected_embeds_at_choosen_layer, pooling='mean'):
     """

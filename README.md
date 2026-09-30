@@ -96,10 +96,42 @@ python scripts/cross_dataset_evaluation.py \
   --device cuda:0
 ```
 
+## textdet: general datasets, zero-shot baselines, browser export
+
+`textdet/` is the reusable core. The scripts are thin command lines over it, and the legacy `models/` package
+stays as it is: saved detectors are pickles of its classes.
+
+| Module | What it does |
+|---|---|
+| `textdet/data` | Loads any labelled table (CSV/JSONL/Parquet/zip, `hf://datasets/...`) as 0 = human / 1 = AI. It has a catalog of benchmarks (MAGE, RAID) and the fixed `select`/`test` split. |
+| `textdet/detectors` | Every detector behind `score(texts)`: Jev-like zero-shot (Julia 1, Laya), off-the-shelf RAID classifiers, Fast-DetectGPT / Binoculars, your saved pickles, browser folders, and ensembles. |
+| `textdet/evaluation` | Metrics (AUROC, **TPR at 1% / 5% FPR**, FPR at the threshold) and per-generator/domain breakdowns. It writes summary files in the format `analyze_cross_dataset.py` ranks. |
+| `textdet/export` | Model folders for the browser app (`deepfake-detection-38502/public/models/<id>/`), like the image models, with weight-only int8 that runs in onnxruntime-web. |
+
+```bash
+# Any detectors on any datasets, the same rows and metrics for all (CPU is fine for a quick run)
+python scripts/evaluate_detectors.py \
+  --detectors julia hf:e5-small-raid hf:tmr-roberta-raid saved:saved_models/<detector>.pkl \
+  --datasets mage_ood_gpt4 mage_ood_gpt4_para mercor_ai:data/mercor-ai/train.csv \
+  --n_rows 400 --stratified_sample --save_summary --output_dir evaluation_results/cross_dataset
+
+# Jev-like baseline (Julia 1 by default, --backend laya for the comparison) on general datasets
+python scripts/evaluate_jev_baseline.py --datasets mage_ood_gpt4 raid_sample --questions ai_generated human_written
+
+# Client-side models for the browser app (hf: and saved: need transformers<5, see requirements-export.txt)
+python scripts/export_web_model.py julia --id julia1-jev
+.venv-export/bin/python scripts/export_web_model.py hf:e5-small-raid --id e5-small-raid
+```
+
+**Read [docs/TEXT_DETECTION_REVIEW.md](docs/TEXT_DETECTION_REVIEW.md) before trusting any number.** It is a
+critical review of the baselines here and in the literature, covers better datasets, and gives the lightweight
+plan with measured results.
+
 ## Project Structure
 
 ```
 deepfake-text-detector/
+├── textdet/                   # Reusable core (data, detectors, evaluation, export): see above
 ├── models/                    # Core ML models and algorithms
 │   ├── extractors.py            # EmbeddingExtractor, feature extraction
 │   ├── classifiers.py           # BinaryDetector, ensemble classifiers
@@ -123,6 +155,9 @@ deepfake-text-detector/
 │   ├── train_and_save_detector.py# Train & save detector models
 │   ├── load_and_evaluate.py     # Model evaluation tools
 │   ├── cross_dataset_evaluation.py# Cross-dataset analysis
+│   ├── evaluate_detectors.py    # Any detectors x any datasets (textdet)
+│   ├── evaluate_jev_baseline.py # Jev-like zero-shot baseline: Julia 1 / Laya
+│   ├── export_web_model.py      # Browser model folders for deepfake-detection-38502
 │   └── launch.md                # Complete training documentation
 ├── notebooks/                 # Jupyter analysis notebooks
 │   └── kaggle_competition_submission.ipynb

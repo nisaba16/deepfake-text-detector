@@ -1,0 +1,11 @@
+# Environment for scripts/export_web_model.py with hf: and saved: detectors (torch.onnx.export).
+# transformers 5.x breaks TorchScript tracing of the attention mask, so keep it apart from the main env:
+#   uv venv --system-site-packages .venv-export
+#   VIRTUAL_ENV=.venv-export uv pip install -r requirements-export.txt
+#   .venv-export/bin/python scripts/export_web_model.py hf:e5-small-raid
+# (julia exports need none of this: they reuse the official ONNX graph.)
+transformers>=4.48,<5
+onnx>=1.16
+onnxruntime>=1.20
+tokenizers>=0.21
+xgboost          # imported by models/classifiers.py, needed to unpickle saved detectors

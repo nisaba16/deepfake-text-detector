@@ -10,9 +10,9 @@ import pandas as pd
 
 FILENAME_RE = re.compile(
     r"""^cross_dataset_summary_
-        (?P<train_ds>[^_]+)_
+        (?P<train_ds>human_ai|mercor_ai|[^_]+)_
         (?P<model>.+?)_
-        (?P<analysis>embedding|tfidf|perplexity|phd)
+        (?P<analysis>embedding|tfidf|perplexity|phd|jev|lmstat|hfclf|webmodel|ensemble)
         (?:_layer(?P<layer>-?\d+))?
         (?:_(?P<pooling>mean_std|mean|last|statistical))?
         (?:_(?P<norm>l2norm))?
@@ -148,6 +148,10 @@ def pick_metric_value(df: pd.DataFrame, metric: str, train_ds: Optional[str]) ->
 BINARY_FAMILY = {"svm", "lr", "logreg", "neural", "mlp", "xgb", "xgboost"}
 OUTLIER_FAMILY = {"ocsvm", "oneclasssvm", "elliptic", "elliptic_envelope", "iforest", "isoforest"}
 
+ANALYSIS_FAMILY = {"jev": "zeroshot", "lmstat": "zeroshot",
+                   "hfclf": "pretrained", "webmodel": "pretrained", "ensemble": "pretrained"}
+
+
 def classifier_family(name: str) -> str:
     n = name.lower()
     if n in BINARY_FAMILY:
@@ -173,7 +177,9 @@ def load_and_flatten(input_dir: Path, metric: str, filter_model: Optional[str] =
             continue
 
         metric_value, chosen_target = pick_metric_value(df, metric, meta.get("train_dataset"))
-        fam = classifier_family(meta["classifier"])
+        # Detectors we did not train are ranked apart: zero-shot (Jev-like, likelihood statistics) and
+        # pretrained (off-the-shelf classifiers, browser models, ensembles of them)
+        fam = ANALYSIS_FAMILY.get(meta["analysis_type"]) or classifier_family(meta["classifier"])
         row = {
             **meta,
             "metric": metric,
@@ -196,7 +202,7 @@ def load_and_flatten(input_dir: Path, metric: str, filter_model: Optional[str] =
             else (
                 f"layer{r['layer']}_{r['pooling']}_{'l2' if r['normalized'] else 'noL2'}_{r['classifier']}"
                 if r["analysis_type"] == "embedding"
-                else f"tfidf_{r['classifier']}"
+                else f"{r['analysis_type']}_{r['classifier']}"
             )
         ),
         axis=1,
@@ -217,11 +223,13 @@ def top_and_worst_per_model(df: pd.DataFrame, top_k: int) -> Tuple[pd.DataFrame,
 def main():
     parser = argparse.ArgumentParser(description="Analyze cross-dataset summaries and rank configs per model.")
     parser.add_argument("--input_dir", type=str, required=True)
-    parser.add_argument("--metric", type=str, default="f1")
+    parser.add_argument("--metric", type=str, default="roc_auc",
+                        help="Ranking metric (roc_auc does not depend on the decision threshold)")
     parser.add_argument("--top_k", type=int, default=15)
     parser.add_argument("--filter_model", type=str, default=None)
-    parser.add_argument("--family", type=str, default="all", choices=["all", "binary", "outlier"],
-                        help="Filter by classifier family.")
+    parser.add_argument("--family", type=str, default="all", choices=["all", "binary", "outlier", "zeroshot", "pretrained"],
+                        help="Filter by family: binary / outlier (trained here), zeroshot (Jev-like, "
+                             "Fast-DetectGPT, Binoculars), pretrained (off-the-shelf classifiers).")
     parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
 
@@ -252,7 +260,7 @@ def main():
 
     # If all, also emit per-family splits
     if args.family == "all":
-        for fam in ["binary", "outlier"]:
+        for fam in ["binary", "outlier", "zeroshot", "pretrained"]:
             fam_df = flat[flat["family"] == fam].copy()
             if fam_df.empty:
                 continue

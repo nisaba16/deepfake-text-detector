@@ -47,6 +47,17 @@ aioredis>=2.0.0
 accelerate>=0.10.0
 datasets>=2.0.0
 
+# Jev-like zero-shot baseline (scripts/evaluate_jev_baseline.py), Python >= 3.10
+# Julia 1 (default backend) runs natively and needs transformers>=5 (its mmBERT config); laya is the
+# optional comparison backend (--backend laya)
+laya>=0.3.21
+
+# textdet: reading hf://datasets/... files (MAGE, RAID) and running exported browser models
+huggingface_hub>=0.23
+tokenizers>=0.21
+onnx>=1.16
+onnxruntime>=1.20
+
 # Logging & Monitoring
 python-json-logger>=2.0.0
 

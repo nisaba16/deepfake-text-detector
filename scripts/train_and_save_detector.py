@@ -16,7 +16,7 @@ import torch.nn.functional as F
 sys.path.append(str(Path(__file__).parent))
 sys.path.append(str(Path(__file__).parent.parent))
 
-from models.extractors import EmbeddingExtractor, pool_embeds_from_layer, TFIDFExtractor
+from models.extractors import EmbeddingExtractor, pool_embeds_from_layer, l2_normalize_tokens, TFIDFExtractor
 from models.text_features import PerplexityCalculator, TextIntrinsicDimensionCalculator
 from models.classifiers import BinaryDetector, OutlierDetections
 from models.specialized_extractors import get_specialized_extractor
@@ -126,6 +126,9 @@ def get_features(texts: List[str], extractor, args, show_progress: bool = True):
             # Determine valid layer index
             available_layers = sorted(list(embeds_all[0].keys())) if embeds_all else []
             chosen_layer = args.layer
+            if chosen_layer < 0:
+                # Python-style index into hidden_states, as in the memory-efficient path (-1 = last)
+                chosen_layer += len(available_layers)
             if chosen_layer not in available_layers:
                 # Fallback to last available layer
                 if available_layers:
@@ -141,7 +144,7 @@ def get_features(texts: List[str], extractor, args, show_progress: bool = True):
 
             layer_embeds = [embeds[chosen_layer] for embeds in embeds_all]
             if getattr(args, 'normalize', False):
-                layer_embeds = [F.normalize(torch.from_numpy(e), p=2, dim=1).numpy() for e in layer_embeds]
+                layer_embeds = l2_normalize_tokens(layer_embeds)
             features = pool_embeds_from_layer(layer_embeds, pooling=args.pooling)
 
     elif args.analysis_type == "perplexity":
@@ -294,9 +297,48 @@ def save_detector_and_metadata(detector: BinaryDetector, args, save_dir: Path, m
             print(f"⚠️  Warning: failed to save TF-IDF vectorizer: {e}")
 
 
-def load_human_ai_dataset(data_path: str, n_rows: int = None) -> Tuple[List[str], np.ndarray]:
-    """Load the AI_Human.csv dataset with optional row limiting."""
-    df = pd.read_csv(data_path, nrows=n_rows)
+def sample_rows(df: pd.DataFrame, label_col: str, n_rows: int = None, stratified: bool = False,
+                seed: int = 42) -> pd.DataFrame:
+    """Random subset of n_rows taken from the whole file (all rows when n_rows is None).
+
+    The CSVs are not shuffled, so their first rows are a biased slice: the first 10k rows of
+    AI_Human.csv only contain AI essays about two prompts. With stratified=True the subset is
+    balanced: n_rows // n_classes rows per class (fewer if a class is smaller).
+    """
+    if not n_rows:
+        return df
+    if stratified:
+        per_class = n_rows // df[label_col].nunique()
+        parts = [g.sample(min(per_class, len(g)), random_state=seed) for _, g in df.groupby(label_col)]
+        return pd.concat(parts).sample(frac=1, random_state=seed)  # mix the classes
+    return df.sample(min(n_rows, len(df)), random_state=seed)
+
+
+def coerce_binary_labels(df: pd.DataFrame, label_col: str) -> pd.DataFrame:
+    """Labels as int 0/1 (numbers, bools or 'true'/'false'); rows without a label are dropped.
+
+    Unparseable labels used to become 0 (human) silently; anything that is not 0/1 is now an error.
+    """
+    raw = df[label_col]
+    if raw.dtype == object:
+        raw = raw.astype(str).str.strip().str.lower().replace({'true': '1', 'false': '0'})
+    labels = pd.to_numeric(raw, errors='coerce')
+    missing = labels.isna()
+    if missing.any():
+        print(f"⚠️  Dropping {int(missing.sum())} rows without a numeric '{label_col}' label "
+              f"(e.g. {df.loc[missing, label_col].astype(str).unique()[:3].tolist()})")
+    labels = labels[~missing]
+    if labels.empty or not labels.isin([0, 1]).all():
+        raise ValueError(f"'{label_col}' must hold binary 0/1 labels, found {sorted(pd.unique(labels))[:10]}")
+    df = df.loc[~missing].copy()
+    df[label_col] = labels.astype(int)
+    return df
+
+
+def load_human_ai_dataset(data_path: str, n_rows: int = None, stratified: bool = False,
+                          seed: int = 42) -> Tuple[List[str], np.ndarray]:
+    """Load the AI_Human.csv dataset, optionally a random subset of n_rows."""
+    df = sample_rows(pd.read_csv(data_path), 'generated', n_rows, stratified, seed)
     texts = sanitize_texts(df['text'].astype(str).tolist())
     labels = df['generated'].astype(int).to_numpy()  # 0=human, 1=AI
     return texts, labels
@@ -321,21 +363,24 @@ def _resolve_daigtv2_csv_path(data_path: str) -> Path:
     raise FileNotFoundError(f"Could not find DAIGT v2 CSV at {data_path}")
 
 
-def load_daigtv2_dataset(data_path: str, n_rows: int = None) -> Tuple[List[str], np.ndarray]:
-    """Load the DAIGT v2 dataset.
+def load_daigtv2_dataset(data_path: str, n_rows: int = None, stratified: bool = False,
+                         seed: int = 42) -> Tuple[List[str], np.ndarray]:
+    """Load the DAIGT v2 dataset, optionally a random subset of n_rows.
 
     Expected columns: 'text' (string), 'label' (0/1). Additional columns are ignored.
     The function accepts a direct CSV path or a directory containing the CSV.
     """
     csv_path = _resolve_daigtv2_csv_path(data_path)
-    df = pd.read_csv(csv_path, nrows=n_rows)
+    df = pd.read_csv(csv_path)
     if 'text' not in df.columns or 'label' not in df.columns:
         raise ValueError(
             f"DAIGT v2 CSV must contain 'text' and 'label' columns. Found: {list(df.columns)}"
         )
-    texts = sanitize_texts(df['text'].astype(str).tolist())
     # Some DAIGT releases may have label as bool/str; coerce to int {0,1}
-    labels = pd.to_numeric(df['label'], errors='coerce').fillna(0).astype(int).to_numpy()
+    df = coerce_binary_labels(df, 'label')
+    df = sample_rows(df, 'label', n_rows, stratified, seed)
+    texts = sanitize_texts(df['text'].astype(str).tolist())
+    labels = df['label'].to_numpy()
     return texts, labels
 
 
@@ -359,12 +404,9 @@ def train_detector(train_texts: List[str], train_labels: np.ndarray, args) -> Tu
     outlier_types = {"elliptic", "ocsvm", "iforest"}
     if args.classifier_type in outlier_types:
         # For TF-IDF + one-class, ensure dense features (StandardScaler/PCA expect dense)
-        try:
-            from scipy.sparse import issparse
-            if args.analysis_type == "tfidf" and 'issparse' in globals() and issparse(train_features):
-                train_features = train_features.toarray().astype(np.float32)
-        except Exception:
-            pass
+        from scipy.sparse import issparse
+        if issparse(train_features):
+            train_features = train_features.toarray().astype(np.float32)
         # Use OutlierDetections (one-class style) with its own PCA pipeline
         detector = OutlierDetections(
             detector_type=args.classifier_type,
@@ -400,22 +442,18 @@ def train_detector(train_texts: List[str], train_labels: np.ndarray, args) -> Tu
 
 def run_training_pipeline(args):
     """Main training pipeline."""
-    # Load training data
+    # Load training data (--n_rows: random subset of the whole file, balanced with --stratified_sample)
+    n_rows = getattr(args, 'n_rows', None)
+    stratified = getattr(args, 'stratified_sample', False)
+    seed = getattr(args, 'random_state', 42)
     if args.dataset_name == "human_ai":
-        train_texts, train_labels = load_human_ai_dataset(
-            args.train_data_path, n_rows=getattr(args, 'n_rows', None)
-        )
+        train_texts, train_labels = load_human_ai_dataset(args.train_data_path, n_rows, stratified, seed)
     elif args.dataset_name in {"daigtv2", "daigt_v2", "daigt"}:
         # Dedicated loader with fixed columns
-        train_texts, train_labels = load_daigtv2_dataset(
-            args.train_data_path, n_rows=getattr(args, 'n_rows', None)
-        )
+        train_texts, train_labels = load_daigtv2_dataset(args.train_data_path, n_rows, stratified, seed)
     else:
         # For other datasets, load from CSV with specified columns
-        read_kwargs = {}
-        if getattr(args, 'n_rows', None):
-            read_kwargs['nrows'] = args.n_rows
-        train_df = pd.read_csv(args.train_data_path, **read_kwargs)
+        train_df = pd.read_csv(args.train_data_path)
         # Allow dataset-specific smart defaults if user didn't override columns
         text_col = getattr(args, 'text_column', None)
         label_col = getattr(args, 'label_column', None)
@@ -435,8 +473,11 @@ def run_training_pipeline(args):
                 f"Could not infer text/label columns. Available columns: {list(train_df.columns)}.\n"
                 f"Pass --text_column and --label_column explicitly."
             )
+        args.text_column, args.label_column = text_col, label_col  # record the inferred columns in metadata
+        train_df = coerce_binary_labels(train_df, label_col)
+        train_df = sample_rows(train_df, label_col, n_rows, stratified, seed)
         train_texts = sanitize_texts(train_df[text_col].astype(str).tolist())
-        train_labels = pd.to_numeric(train_df[label_col], errors='coerce').fillna(0).astype(int).to_numpy()
+        train_labels = train_df[label_col].to_numpy()
 
     # Optional sampling for faster experiments
     if getattr(args, 'sample_frac', None):
@@ -506,8 +547,10 @@ if __name__ == "__main__":
     # Dataset configuration
     parser.add_argument("--dataset_name", type=str, default="human_ai", help="Dataset identifier for naming")
     parser.add_argument("--train_data_path", type=str, required=True, help="Path to training data CSV")
-    parser.add_argument("--text_column", type=str, default="text", help="Name of the text column")
-    parser.add_argument("--label_column", type=str, default="generated", help="Name of the label column")
+    parser.add_argument("--text_column", type=str, default=None,
+                        help="Name of the text column (default: first of text/content/answer found)")
+    parser.add_argument("--label_column", type=str, default=None,
+                        help="Name of the label column (default: first of label/generated/is_cheating/target found)")
 
     # Feature extraction parameters
     parser.add_argument("--layer", type=int, default=22, help="Layer index for embedding/phd analysis")
@@ -532,9 +575,9 @@ if __name__ == "__main__":
     parser.add_argument("--memory_log_interval", type=int, default=1, help="Batches between memory log prints")
 
     # Data subsampling options for large CSVs
-    parser.add_argument("--n_rows", type=int, default=None, help="Read only the first N rows from CSV (for quick tests)")
+    parser.add_argument("--n_rows", type=int, default=None, help="Use a random subset of N rows from the whole CSV (not the first N: the files are not shuffled)")
     parser.add_argument("--sample_frac", type=float, default=None, help="Optionally sample a fraction of rows after loading (0<frac<=1)")
-    parser.add_argument("--stratified_sample", action="store_true", help="When loading with --n_rows, sample balanced classes (50/50 real/fake)")
+    parser.add_argument("--stratified_sample", action="store_true", help="With --n_rows, sample balanced classes (N/2 real, N/2 fake)")
     parser.add_argument("--random_state", type=int, default=42, help="Random seed for sampling")
 
     # TF-IDF specific parameters

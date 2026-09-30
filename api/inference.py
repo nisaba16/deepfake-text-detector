@@ -202,16 +202,18 @@ class LocalInferenceEngine(BaseInferenceEngine):
                 f"Found candidates: {candidates if candidates else 'NONE'}"
             )
         
-        # Load detector
-        with open(model_path, "rb") as f:
-            detector = pickle.load(f)
-        
-        # Load metadata
-        metadata = {}
-        metadata_path = model_path.with_name(model_path.stem + "_metadata.pkl")
-        if metadata_path.exists():
-            with open(metadata_path, "rb") as f:
-                metadata = pickle.load(f)
+        # Load detector and metadata once per file version (a redeployed file has a new mtime)
+        cache_key = (str(model_path), model_path.stat().st_mtime)
+        if cache_key not in self.detector_cache:
+            with open(model_path, "rb") as f:
+                detector = pickle.load(f)
+            metadata = {}
+            metadata_path = model_path.with_name(model_path.stem + "_metadata.pkl")
+            if metadata_path.exists():
+                with open(metadata_path, "rb") as f:
+                    metadata = pickle.load(f)
+            self.detector_cache[cache_key] = (detector, metadata)
+        detector, metadata = self.detector_cache[cache_key]
         
         # Extract features based on analysis type using proper extractors
         analysis_type = metadata.get("analysis_type", "embedding")
@@ -261,16 +263,25 @@ class LocalInferenceEngine(BaseInferenceEngine):
             batch_size = metadata.get("batch_size", 16)
             max_length = metadata.get("max_length", 512)
             use_specialized = metadata.get("use_specialized_extraction", False)
+            device = "cuda" if self.torch.cuda.is_available() else "cpu"
+
+            if use_specialized:
+                # Trained on the model's recommended embedding (no layer/pooling): extract it the same way.
+                # Without a specialized extractor, training used the generic path below.
+                from models.specialized_extractors import get_specialized_extractor
+                key = ("specialized", model_name)
+                if key not in self.extractor_cache:
+                    self.extractor_cache[key] = get_specialized_extractor(model_name, device)
+                if self.extractor_cache[key] is not None:
+                    return self.extractor_cache[key].extract([processed_text], batch_size=1, max_length=max_length)
             
             # Create extractor if not cached
-            if model_name not in self.extractor_cache:
+            key = ("embedding", model_name)
+            if key not in self.extractor_cache:
                 logger.info(f"Creating EmbeddingExtractor for {model_name}")
-                self.extractor_cache[model_name] = self.EmbeddingExtractor(
-                    model_name=model_name,
-                    device="cuda" if self.torch.cuda.is_available() else "cpu"
-                )
+                self.extractor_cache[key] = self.EmbeddingExtractor(model_name=model_name, device=device)
             
-            extractor = self.extractor_cache[model_name]
+            extractor = self.extractor_cache[key]
             
             # Extract embeddings using get_pooled_layer_embeddings (more efficient)
             try:
@@ -293,14 +304,15 @@ class LocalInferenceEngine(BaseInferenceEngine):
             model_name = metadata.get("model_name", "Qwen/Qwen2.5-0.5B")
             max_length = metadata.get("max_length", 512)
             
-            if model_name not in self.extractor_cache:
+            key = ("perplexity", model_name)  # keyed by analysis type: models can share a base model
+            if key not in self.extractor_cache:
                 logger.info(f"Creating PerplexityCalculator for {model_name}")
-                self.extractor_cache[model_name] = self.PerplexityCalculator(
+                self.extractor_cache[key] = self.PerplexityCalculator(
                     model_name=model_name,
                     device="cuda" if self.torch.cuda.is_available() else "cpu"
                 )
             
-            extractor = self.extractor_cache[model_name]
+            extractor = self.extractor_cache[key]
             perplexity = extractor.calculate_perplexity(processed_text, max_length=max_length)
             return np.array([[perplexity]])
         
@@ -309,16 +321,17 @@ class LocalInferenceEngine(BaseInferenceEngine):
             layer = metadata.get("layer", 16)
             max_length = metadata.get("max_length", 512)
             
-            if model_name not in self.extractor_cache:
+            key = ("phd", model_name, layer)
+            if key not in self.extractor_cache:
                 logger.info(f"Creating TextIntrinsicDimensionCalculator for {model_name}")
-                self.extractor_cache[model_name] = self.TextIntrinsicDimensionCalculator(
+                self.extractor_cache[key] = self.TextIntrinsicDimensionCalculator(
                     model_name=model_name,
-                    layer=layer,
+                    layer_idx=layer,
                     device="cuda" if self.torch.cuda.is_available() else "cpu"
                 )
             
-            extractor = self.extractor_cache[model_name]
-            phd_value = extractor.calculate([processed_text], max_length=max_length)[0]
+            extractor = self.extractor_cache[key]
+            phd_value = extractor.calculate_batch([processed_text], max_length=max_length)[0]
             return np.array([[phd_value]])
         
         elif analysis_type == "tfidf":
